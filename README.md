@@ -4,7 +4,7 @@ A tool for blocking routes in Steam games that use network_config.json
 Note: This will automatically clear any CSGORoutingTool firewall rules upon launch (to save the need to clear those rules in that application).
 
 ## Supports:
-Blocking specific routes for games that use Valve's network_config.json (e.g. Counter-Strike: Global Offensive & Dota 2).
+Blocking specific routes for games that use Valve's network_config.json (e.g. Counter-Strike 2 & Dota 2).
 
 ## How to use
 * Click the checkbox of the route(s) you'd like to block.
@@ -20,9 +20,11 @@ Blocking specific routes for games that use Valve's network_config.json (e.g. Co
 ## Credits
 #### Froody
 Tool creation.
+#### BxdiS
+Tool fork.
 #### Newtonsoft
 Newtonsoft.Json package, licensed under MIT. https://github.com/JamesNK/Newtonsoft.Json/
 #### Icon
 https://github.com/feathericons/feather#feather
 
-Contact me on Discord for faster help: Froody#5824
+Contact me on Discord for faster help: mjstcrp
