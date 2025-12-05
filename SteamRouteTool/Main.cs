@@ -20,7 +20,7 @@ namespace SteamRouteTool
         int rowCount = 0;
         bool columnChecked = false;
         bool firstLoad = true;
-        string networkconfigURL = @"https://steamcdn-a.akamaihd.net/apps/sdr/network_config.json";
+        string networkconfigURL = @"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=7";
 
         public Main()
         {
@@ -408,7 +408,7 @@ namespace SteamRouteTool
 
         private void Btn_About_Click(object sender, EventArgs e)
         {
-            MessageBox.Show("Version: " + ProductVersion + Environment.NewLine + "Steam Route Tool is created by Froody.", "About", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("Version: " + ProductVersion + Environment.NewLine + "Steam Route Tool is created by Froody." + Environment.NewLine + "Forked by BxdiS", "About", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 }
