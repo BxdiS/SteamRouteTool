@@ -14,9 +14,6 @@ Blocking specific routes for games that use Valve's network_config.json (e.g. Co
 * Clear Rules will clear all firewall rules.
 * Ping Routes will ping all routes and update their values.
 
-## Images
-![Main](https://dev.froody.tech/SteamRouteTool/img/Main.png)
-
 ## Credits
 #### Froody
 Tool creation.
