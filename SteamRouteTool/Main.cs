@@ -3,13 +3,11 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
-using System.IO;
 using System.Linq;
-using System.Net;
+using System.Net.Http;
 using System.Net.NetworkInformation;
-using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace SteamRouteTool
@@ -22,29 +20,59 @@ namespace SteamRouteTool
         bool firstLoad = true;
         string networkconfigURL = @"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=7";
 
+        // Reused across requests to avoid socket exhaustion.
+        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+
         public Main()
         {
             InitializeComponent();
             ClearCSGORoutingToolRules();
-            Thread populateRoutesThread = new Thread(new ThreadStart(PopulateRoutes));
-            populateRoutesThread.Start();
+            // Kick off route loading once the form handle has been created, so that
+            // the async continuation can safely marshal back to the UI thread.
+            Load += async (s, e) => await PopulateRoutesAsync();
         }
 
+        // Removes any leftover SteamRouteTool rules from a previous session.
+        // Names are collected first to avoid modifying the collection during iteration.
         private void ClearCSGORoutingToolRules()
         {
             Type tNetFwPolicy2 = Type.GetTypeFromProgID("HNetCfg.FwPolicy2");
             INetFwPolicy2 fwPolicy2 = (INetFwPolicy2)Activator.CreateInstance(tNetFwPolicy2);
+            List<string> toRemove = new List<string>();
             foreach (INetFwRule rule in fwPolicy2.Rules)
             {
-                if (rule.Name.Contains("CSGORoutingTool-")) { fwPolicy2.Rules.Remove(rule.Name); }
+                if (rule.Name.StartsWith("SteamRouteTool-")) { toRemove.Add(rule.Name); }
             }
+            foreach (string name in toRemove) { fwPolicy2.Rules.Remove(name); }
         }
 
-        private void PopulateRoutes()
+        // Loads routes asynchronously so the UI stays responsive.
+        private async Task PopulateRoutesAsync()
         {
-            string raw = new WebClient().DownloadString(networkconfigURL);
-            JObject jObj = JsonConvert.DeserializeObject<JObject>(raw);
+            try
+            {
+                string raw = await _httpClient.GetStringAsync(networkconfigURL);
 
+                // Parse JSON on a background thread to avoid blocking the UI.
+                await Task.Run(() => ParseRoutes(raw));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Failed to load routes: " + ex.Message, "Steam Route Tool - Error");
+                return;
+            }
+
+            // Back on UI thread after await — safe to update controls directly.
+            btn_PingRoutes.Enabled = true;
+            lb_GettingRoutes.Visible = false;
+            btn_About.Visible = true;
+            PopulateRouteDataGrid();
+        }
+
+        // Parses the SDR JSON and fills the routes list. Runs on a background thread.
+        private void ParseRoutes(string raw)
+        {
+            JObject jObj = JsonConvert.DeserializeObject<JObject>(raw);
             foreach (KeyValuePair<string, JToken> rc in (JObject)jObj["pops"])
             {
                 if (rc.Value.ToString().Contains("relays") && !rc.Value.ToString().Contains("cloud-test"))
@@ -68,22 +96,6 @@ namespace SteamRouteTool
                     routes.Add(route);
                 }
             }
-
-            btn_PingRoutes.BeginInvoke(new MethodInvoker(() =>
-            {
-                btn_PingRoutes.Enabled = true;
-            }));
-            lb_GettingRoutes.BeginInvoke(new MethodInvoker(() =>
-            {
-                lb_GettingRoutes.Visible = false;
-            }));
-            btn_About.BeginInvoke(new MethodInvoker(() =>
-            {
-                btn_About.Visible = true;
-            }));
-
-            if (InvokeRequired) { Invoke((Action)PopulateRouteDataGrid); }
-            else { PopulateRouteDataGrid(); }
         }
 
         private void PopulateRouteDataGrid()
@@ -110,7 +122,6 @@ namespace SteamRouteTool
                     }
                     if (i > 0 && route.extended == false) { routeDataGrid.Rows[route.row_index[i]].Visible = false; }
                     else { routeDataGrid.Rows[route.row_index[i]].Visible = true; }
-
                 }
             }
 
@@ -122,58 +133,45 @@ namespace SteamRouteTool
             firstLoad = false;
         }
 
-        private void PingSingleRoute(Route route)
+        // Applies ping result color and value to a single grid cell. Must be called on the UI thread.
+        private void UpdatePingCell(int rowIndex, string responseTime)
         {
-            Thread thread = new Thread(() =>
+            DataGridViewCellStyle style = routeDataGrid.Rows[rowIndex].Cells[1].Style;
+            if (responseTime != "-1")
             {
-                for (int i = 0; i < route.ranges.Count; i++)
-                {
-                    routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.Black;
-                    string responseTime = PingHost(route.ranges.Keys.ToArray()[i]);
-                    if (responseTime != "-1")
-                    {
-                        if (Convert.ToInt32(responseTime) <= 50) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Green; }
-                        if (Convert.ToInt32(responseTime) > 50 && Convert.ToInt32(responseTime) <= 100) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Orange; }
-                        if (Convert.ToInt32(responseTime) > 100) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Red; }
-                    }
-                    else
-                    {
-                        routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.DarkRed;
-                    }
-                    routeDataGrid.Rows[route.row_index[i]].Cells[1].Value = responseTime;
-                    routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.White;
-                }
-            });
-
-            thread.Start();
+                int ms = Convert.ToInt32(responseTime);
+                if (ms <= 50) { style.ForeColor = Color.Green; }
+                else if (ms <= 100) { style.ForeColor = Color.Orange; }
+                else { style.ForeColor = Color.Red; }
+            }
+            else
+            {
+                style.ForeColor = Color.DarkRed;
+            }
+            routeDataGrid.Rows[rowIndex].Cells[1].Value = responseTime;
+            style.BackColor = Color.White;
         }
 
+        // Pings each relay of a single route asynchronously. UI updates happen on the UI thread
+        // after each await, so no BeginInvoke is required.
+        private async void PingSingleRoute(Route route)
+        {
+            string[] keys = route.ranges.Keys.ToArray();
+            for (int i = 0; i < keys.Length; i++)
+            {
+                routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.Black;
+                string responseTime = await Task.Run(() => PingHost(keys[i]));
+                // Continuation runs on the UI thread via the captured SynchronizationContext.
+                UpdatePingCell(route.row_index[i], responseTime);
+            }
+        }
+
+        // Starts pinging all routes in parallel (each route is an independent async task).
         private void PingRoutes()
         {
             foreach (Route route in routes)
             {
-                Thread thread = new Thread(() =>
-                {
-                    for (int i = 0; i < route.ranges.Count; i++)
-                    {
-                        routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.Black;
-                        string responseTime = PingHost(route.ranges.Keys.ToArray()[i]);
-                        if (responseTime != "-1")
-                        {
-                            if (Convert.ToInt32(responseTime) <= 50) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Green; }
-                            if (Convert.ToInt32(responseTime) > 50 && Convert.ToInt32(responseTime) <= 100) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Orange; }
-                            if (Convert.ToInt32(responseTime) > 100) { routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.Red; }
-                        }
-                        else
-                        {
-                            routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.ForeColor = Color.DarkRed;
-                        }
-                        routeDataGrid.Rows[route.row_index[i]].Cells[1].Value = responseTime;
-                        routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.White;
-                    }
-                });
-
-                thread.Start();
+                PingSingleRoute(route);
             }
         }
 
@@ -186,7 +184,7 @@ namespace SteamRouteTool
                 if (pingreply.RoundtripTime == 0) { return "-1"; }
                 else { return pingreply.RoundtripTime.ToString(); }
             }
-            catch (Exception ex) { return "-1"; }
+            catch (Exception) { return "-1"; }
         }
 
         private void GetCurrentBlocked()
@@ -196,9 +194,10 @@ namespace SteamRouteTool
 
             foreach (INetFwRule rule in fwPolicy2.Rules)
             {
-                if (rule.Name.Contains("SteamRouteTool-"))
+                if (rule.Name.StartsWith("SteamRouteTool-"))
                 {
-                    string name = rule.Name.Split('-')[1];
+                    // Use Substring so route names that contain hyphens are parsed correctly.
+                    string name = rule.Name.Substring("SteamRouteTool-".Length);
 
                     List<string> addr = new List<string>();
                     foreach (string tosplit in rule.RemoteAddresses.Split(',')) { addr.Add(tosplit.Split('/')[0]); }
@@ -214,11 +213,11 @@ namespace SteamRouteTool
                                 if (addr.Contains(route.ranges.Keys.ToArray()[i]))
                                 {
                                     routeDataGrid.Rows[route.row_index[i]].Cells[2].Value = true;
-                                    if (i != 0) { blockedCount++;  }
+                                    if (i != 0) { blockedCount++; }
                                     if (i == 0) { firstBlocked = true; }
                                 }
                             }
-                            if (blockedCount == route.ranges.Count-1 && firstBlocked)
+                            if (blockedCount == route.ranges.Count - 1 && firstBlocked)
                             {
                                 extended = false;
                             }
@@ -237,11 +236,19 @@ namespace SteamRouteTool
         {
             Type tNetFwPolicy2 = Type.GetTypeFromProgID("HNetCfg.FwPolicy2");
             INetFwPolicy2 fwPolicy2 = (INetFwPolicy2)Activator.CreateInstance(tNetFwPolicy2);
+
+            // Collect names first to avoid modifying the collection during iteration.
+            List<string> toRemove = new List<string>();
             foreach (INetFwRule rule in fwPolicy2.Rules)
             {
-                if (rule.Name.Contains("SteamRouteTool-")) { fwPolicy2.Rules.Remove(rule.Name); }
-                for (int i = 0; i < routes.Count; i++) { routeDataGrid.Rows[i].Cells[2].Value = false; }
+                if (rule.Name.StartsWith("SteamRouteTool-")) { toRemove.Add(rule.Name); }
             }
+            foreach (string name in toRemove) { fwPolicy2.Rules.Remove(name); }
+
+            // Reset all checkbox cells (use Rows.Count, not routes.Count, because each route
+            // may have multiple relay rows).
+            for (int i = 0; i < routeDataGrid.Rows.Count; i++) { routeDataGrid.Rows[i].Cells[2].Value = false; }
+
             MessageBox.Show("You have cleared all firewall rules created by this tool.", "Steam Route Tool - Rules Clear");
         }
 
@@ -287,43 +294,7 @@ namespace SteamRouteTool
 
             if (e.ColumnIndex == 1 && e.RowIndex != -1)
             {
-                Thread thread = new Thread(() =>
-                {
-                    Route currentRoute = routes.Where(x => x.row_index.Contains(e.RowIndex)).First();
-                    for (int i = 0; i < currentRoute.row_index.Count; i++)
-                    {
-                        if (currentRoute.row_index[i] == e.RowIndex)
-                        {
-                            routeDataGrid.Rows[e.RowIndex].Cells[1].Style.BackColor = Color.Black;
-                            string responseTime = PingHost(currentRoute.ranges.Keys.ToArray()[i]);
-
-                            if (responseTime != "-1")
-                            {
-                                if (Convert.ToInt32(responseTime) <= 50)
-                                {
-                                    routeDataGrid.Rows[e.RowIndex].Cells[1].Style.ForeColor = Color.Green;
-                                }
-                                if (Convert.ToInt32(responseTime) > 50 && Convert.ToInt32(responseTime) <= 100)
-                                {
-                                    routeDataGrid.Rows[e.RowIndex].Cells[1].Style.ForeColor = Color.Orange;
-                                }
-                                if (Convert.ToInt32(responseTime) > 100)
-                                {
-                                    routeDataGrid.Rows[e.RowIndex].Cells[1].Style.ForeColor = Color.Red;
-                                }
-                            }
-                            else
-                            {
-                                routeDataGrid.Rows[e.RowIndex].Cells[1].Style.ForeColor = Color.DarkRed;
-                            }
-
-
-                            routeDataGrid.Rows[e.RowIndex].Cells[1].Value = responseTime;
-                            routeDataGrid.Rows[e.RowIndex].Cells[1].Style.BackColor = Color.White;
-                        }
-                    }
-                });
-                thread.Start();
+                _ = PingSingleCellAsync(e.RowIndex);
             }
 
             if (e.ColumnIndex == 2 && e.RowIndex != -1)
@@ -335,7 +306,7 @@ namespace SteamRouteTool
             }
 
             if (e.ColumnIndex == 2 && e.RowIndex == -1)
-           { 
+            {
                 if (!columnChecked)
                 {
                     for (int i = 0; i < routeDataGrid.Rows.Count; i++)
@@ -348,14 +319,39 @@ namespace SteamRouteTool
                     }
                     columnChecked = true;
                 }
-                else if (columnChecked)
+                else
                 {
                     for (int i = 0; i < routeDataGrid.Rows.Count; i++)
                     {
                         routeDataGrid.Rows[i].Cells[2].Value = false;
                     }
+                    // Remove firewall rules for every route when unchecking all.
+                    foreach (Route route in routes)
+                    {
+                        SetRule(route);
+                    }
                     columnChecked = false;
                 }
+            }
+        }
+
+        // Pings the single cell that was clicked (column 1). Runs asynchronously to keep the UI
+        // responsive; UI updates happen on the UI thread after each await.
+        private async Task PingSingleCellAsync(int rowIndex)
+        {
+            try
+            {
+                Route currentRoute = routes.Where(x => x.row_index.Contains(rowIndex)).First();
+                int i = currentRoute.row_index.IndexOf(rowIndex);
+                string ip = currentRoute.ranges.Keys.ToArray()[i];
+
+                routeDataGrid.Rows[rowIndex].Cells[1].Style.BackColor = Color.Black;
+                string responseTime = await Task.Run(() => PingHost(ip));
+                UpdatePingCell(rowIndex, responseTime);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Ping failed: " + ex.Message, "Steam Route Tool - Error");
             }
         }
 
@@ -381,7 +377,7 @@ namespace SteamRouteTool
                 {
                     if (index == 0 && route.all_check)
                     {
-                        foreach (KeyValuePair<string,string> range in route.ranges)
+                        foreach (KeyValuePair<string, string> range in route.ranges)
                         {
                             remoteAddresses += range.Key + ",";
                         }
