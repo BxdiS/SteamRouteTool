@@ -7,6 +7,7 @@ Note: This will automatically clear any CSGORoutingTool firewall rules upon laun
 Blocking specific routes for games that use Valve's network_config.json (e.g. Counter-Strike 2 & Dota 2).
 
 ## How to use
+* Pick a game in the drop-down (CS2, Dota 2, Deadlock, TF2, L4D2, Underlords, or all of them merged).
 * Click the checkbox of the route(s) you'd like to block.
 * Click the route name to reveal additional routes at that location (if available).
 * Click "Blocked" to toggle all checkboxes.

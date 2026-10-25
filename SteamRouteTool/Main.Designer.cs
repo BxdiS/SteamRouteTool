@@ -37,6 +37,7 @@
             this.btn_ClearRules = new System.Windows.Forms.Button();
             this.lb_GettingRoutes = new System.Windows.Forms.Label();
             this.btn_About = new System.Windows.Forms.Button();
+            this.cb_Game = new System.Windows.Forms.ComboBox();
             ((System.ComponentModel.ISupportInitialize)(this.routeDataGrid)).BeginInit();
             this.SuspendLayout();
             // 
@@ -51,7 +52,7 @@
             this.Name,
             this.Ping,
             this.Blocked});
-            this.routeDataGrid.Location = new System.Drawing.Point(1, 1);
+            this.routeDataGrid.Location = new System.Drawing.Point(1, 24);
             this.routeDataGrid.Name = "routeDataGrid";
             this.routeDataGrid.RowHeadersVisible = false;
             this.routeDataGrid.RowHeadersWidthSizeMode = System.Windows.Forms.DataGridViewRowHeadersWidthSizeMode.DisableResizing;
@@ -88,7 +89,7 @@
             // btn_PingRoutes
             // 
             this.btn_PingRoutes.Enabled = false;
-            this.btn_PingRoutes.Location = new System.Drawing.Point(196, 241);
+            this.btn_PingRoutes.Location = new System.Drawing.Point(196, 264);
             this.btn_PingRoutes.Name = "btn_PingRoutes";
             this.btn_PingRoutes.Size = new System.Drawing.Size(75, 23);
             this.btn_PingRoutes.TabIndex = 1;
@@ -98,7 +99,7 @@
             // 
             // btn_ClearRules
             // 
-            this.btn_ClearRules.Location = new System.Drawing.Point(0, 241);
+            this.btn_ClearRules.Location = new System.Drawing.Point(0, 264);
             this.btn_ClearRules.Name = "btn_ClearRules";
             this.btn_ClearRules.Size = new System.Drawing.Size(77, 23);
             this.btn_ClearRules.TabIndex = 2;
@@ -111,7 +112,7 @@
             this.lb_GettingRoutes.AutoSize = true;
             this.lb_GettingRoutes.Font = new System.Drawing.Font("Microsoft Sans Serif", 8.25F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.lb_GettingRoutes.ForeColor = System.Drawing.Color.Red;
-            this.lb_GettingRoutes.Location = new System.Drawing.Point(98, 246);
+            this.lb_GettingRoutes.Location = new System.Drawing.Point(98, 269);
             this.lb_GettingRoutes.Name = "lb_GettingRoutes";
             this.lb_GettingRoutes.Size = new System.Drawing.Size(82, 13);
             this.lb_GettingRoutes.TabIndex = 3;
@@ -119,7 +120,7 @@
             // 
             // btn_About
             // 
-            this.btn_About.Location = new System.Drawing.Point(111, 241);
+            this.btn_About.Location = new System.Drawing.Point(111, 264);
             this.btn_About.Name = "btn_About";
             this.btn_About.Size = new System.Drawing.Size(51, 23);
             this.btn_About.TabIndex = 4;
@@ -128,11 +129,22 @@
             this.btn_About.Visible = false;
             this.btn_About.Click += new System.EventHandler(this.Btn_About_Click);
             // 
+            // cb_Game
+            // 
+            this.cb_Game.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
+            this.cb_Game.Enabled = false;
+            this.cb_Game.Location = new System.Drawing.Point(1, 1);
+            this.cb_Game.Name = "cb_Game";
+            this.cb_Game.Size = new System.Drawing.Size(269, 21);
+            this.cb_Game.TabIndex = 5;
+            this.cb_Game.SelectedIndexChanged += new System.EventHandler(this.Cb_Game_SelectedIndexChanged);
+            // 
             // Main
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(271, 264);
+            this.ClientSize = new System.Drawing.Size(271, 287);
+            this.Controls.Add(this.cb_Game);
             this.Controls.Add(this.btn_About);
             this.Controls.Add(this.lb_GettingRoutes);
             this.Controls.Add(this.btn_ClearRules);
@@ -158,6 +170,7 @@
         private System.Windows.Forms.DataGridViewTextBoxColumn Ping;
         private System.Windows.Forms.DataGridViewCheckBoxColumn Blocked;
         private System.Windows.Forms.Button btn_About;
+        private System.Windows.Forms.ComboBox cb_Game;
     }
 }
 
