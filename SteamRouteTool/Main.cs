@@ -18,7 +18,24 @@ namespace SteamRouteTool
         int rowCount = 0;
         bool columnChecked = false;
         bool firstLoad = true;
-        string networkconfigURL = @"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=7";
+        const string networkconfigURL = @"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=";
+
+        // Valve online games that use SDR. Games without their own config get Steam's default one.
+        static readonly int[] valveAppIds = { 730, 570, 1422450, 440, 550, 1046930 };
+        static readonly KeyValuePair<string, int[]>[] games =
+        {
+            new KeyValuePair<string, int[]>("All Valve games", valveAppIds),
+            new KeyValuePair<string, int[]>("Counter-Strike 2", new[] { 730 }),
+            new KeyValuePair<string, int[]>("Dota 2", new[] { 570 }),
+            new KeyValuePair<string, int[]>("Deadlock", new[] { 1422450 }),
+            new KeyValuePair<string, int[]>("Team Fortress 2", new[] { 440 }),
+            new KeyValuePair<string, int[]>("Left 4 Dead 2", new[] { 550 }),
+            new KeyValuePair<string, int[]>("Dota Underlords", new[] { 1046930 }),
+            new KeyValuePair<string, int[]>("Steam default (appid 7)", new[] { 7 }),
+        };
+
+        // Bumped on every reload so pings from a previous game don't touch the new grid.
+        int loadGeneration = 0;
 
         // Reused across requests to avoid socket exhaustion.
         private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
@@ -27,9 +44,26 @@ namespace SteamRouteTool
         {
             InitializeComponent();
             ClearCSGORoutingToolRules();
-            // Kick off route loading once the form handle has been created, so that
-            // the async continuation can safely marshal back to the UI thread.
-            Load += async (s, e) => await PopulateRoutesAsync();
+            foreach (KeyValuePair<string, int[]> game in games) { cb_Game.Items.Add(game.Key); }
+            // Selecting the first game triggers route loading once the form handle has been created,
+            // so that the async continuation can safely marshal back to the UI thread.
+            Load += (s, e) => cb_Game.SelectedIndex = 0;
+        }
+
+        private async void Cb_Game_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            loadGeneration++;
+            routes = new List<Route>();
+            rowCount = 0;
+            columnChecked = false;
+            firstLoad = true;
+            routeDataGrid.Rows.Clear();
+            cb_Game.Enabled = false;
+            btn_PingRoutes.Enabled = false;
+            btn_About.Visible = false;
+            lb_GettingRoutes.Visible = true;
+            await PopulateRoutesAsync(games[cb_Game.SelectedIndex].Value);
+            cb_Game.Enabled = true;
         }
 
         // Removes any leftover SteamRouteTool rules from a previous session.
@@ -47,14 +81,21 @@ namespace SteamRouteTool
         }
 
         // Loads routes asynchronously so the UI stays responsive.
-        private async Task PopulateRoutesAsync()
+        private async Task PopulateRoutesAsync(int[] appIds)
         {
             try
             {
-                string raw = await _httpClient.GetStringAsync(networkconfigURL);
+                string[] raws = await Task.WhenAll(appIds.Select(id => _httpClient.GetStringAsync(networkconfigURL + id)));
 
                 // Parse JSON on a background thread to avoid blocking the UI.
-                await Task.Run(() => ParseRoutes(raw));
+                // Configs are merged by POP name, relays deduplicated by IP.
+                await Task.Run(() => { foreach (string raw in raws.Distinct()) { ParseRoutes(raw); } });
+
+                // Rows are assigned after merging so each route's relays stay adjacent in the grid.
+                foreach (Route route in routes)
+                {
+                    for (int i = 0; i < route.ranges.Count; i++) { route.row_index.Add(rowCount++); }
+                }
             }
             catch (Exception ex)
             {
@@ -77,23 +118,27 @@ namespace SteamRouteTool
             {
                 if (rc.Value.ToString().Contains("relays") && !rc.Value.ToString().Contains("cloud-test"))
                 {
-                    Route route = new Route();
-                    route.name = rc.Key;
-                    if (rc.Value.ToString().Contains("\"desc\"")) { route.desc = rc.Value["desc"].ToString(); }
-                    route.ranges = new Dictionary<string, string>();
-                    route.row_index = new List<int>();
+                    Route route = routes.FirstOrDefault(x => x.name == rc.Key);
+                    bool isNew = route == null;
+                    if (isNew)
+                    {
+                        route = new Route();
+                        route.name = rc.Key;
+                        if (rc.Value.ToString().Contains("\"desc\"")) { route.desc = rc.Value["desc"].ToString(); }
+                        route.ranges = new Dictionary<string, string>();
+                        route.row_index = new List<int>();
+                        if (rc.Value.ToString().Contains("partners\": 2")) { route.pw = true; }
+                        else { route.pw = false; }
+                        route.extended = false;
+                        route.all_check = false;
+                    }
                     foreach (JObject range in rc.Value["relays"])
                     {
-                        Console.WriteLine(range["port_range"][0].ToString() + "-" + range["port_range"][1].ToString());
-                        route.ranges.Add(range["ipv4"].ToString(), range["port_range"].ToString());
-                        route.row_index.Add(rowCount);
-                        rowCount++;
+                        string ip = range["ipv4"].ToString();
+                        if (route.ranges.ContainsKey(ip)) { continue; }
+                        route.ranges.Add(ip, range["port_range"].ToString());
                     }
-                    if (rc.Value.ToString().Contains("partners\": 2")) { route.pw = true; }
-                    else { route.pw = false; }
-                    route.extended = false;
-                    route.all_check = false;
-                    routes.Add(route);
+                    if (isNew) { routes.Add(route); }
                 }
             }
         }
@@ -156,11 +201,13 @@ namespace SteamRouteTool
         // after each await, so no BeginInvoke is required.
         private async void PingSingleRoute(Route route)
         {
+            int generation = loadGeneration;
             string[] keys = route.ranges.Keys.ToArray();
             for (int i = 0; i < keys.Length; i++)
             {
                 routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.Black;
                 string responseTime = await Task.Run(() => PingHost(keys[i]));
+                if (generation != loadGeneration) { return; }
                 // Continuation runs on the UI thread via the captured SynchronizationContext.
                 UpdatePingCell(route.row_index[i], responseTime);
             }
@@ -345,8 +392,10 @@ namespace SteamRouteTool
                 int i = currentRoute.row_index.IndexOf(rowIndex);
                 string ip = currentRoute.ranges.Keys.ToArray()[i];
 
+                int generation = loadGeneration;
                 routeDataGrid.Rows[rowIndex].Cells[1].Style.BackColor = Color.Black;
                 string responseTime = await Task.Run(() => PingHost(ip));
+                if (generation != loadGeneration) { return; }
                 UpdatePingCell(rowIndex, responseTime);
             }
             catch (Exception ex)
