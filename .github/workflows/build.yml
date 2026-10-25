@@ -1,0 +1,57 @@
+name: Build & Release
+
+# Builds on every push/PR. A release is published only from master when the
+# AssemblyVersion in Properties/AssemblyInfo.cs has no matching v<version> tag yet.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - uses: NuGet/setup-nuget@v2
+
+      - name: Restore packages
+        run: nuget restore SteamRouteTool.sln
+
+      - name: Build
+        run: msbuild SteamRouteTool.sln /p:Configuration=Release /m
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path SteamRouteTool/Properties/AssemblyInfo.cs -Pattern '^\[assembly: AssemblyVersion\("([^"]+)"\)\]'
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          git fetch --tags --quiet
+          $exists = [bool](git tag --list "v$v")
+          "exists=$exists" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $v, tag exists: $exists"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "SteamRouteTool/bin/Release"
+          Compress-Archive -Path "$out/SteamRouteTool.exe", "$out/SteamRouteTool.exe.config", "$out/Newtonsoft.Json.dll" -DestinationPath SteamRouteTool.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SteamRouteTool-${{ steps.version.outputs.version }}
+          path: SteamRouteTool.zip
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && steps.version.outputs.exists == 'False'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ steps.version.outputs.version }}" SteamRouteTool.zip --target "${{ github.sha }}" --title "v${{ steps.version.outputs.version }}" --generate-notes
