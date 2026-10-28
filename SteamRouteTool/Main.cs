@@ -15,9 +15,7 @@ namespace SteamRouteTool
     public partial class Main : Form
     {
         public List<Route> routes = new List<Route>();
-        int rowCount = 0;
         bool columnChecked = false;
-        bool firstLoad = true;
         const string networkconfigURL = @"https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=";
 
         // Valve online games that use SDR. Games without their own config get Steam's default one.
@@ -37,8 +35,18 @@ namespace SteamRouteTool
         // Bumped on every reload so pings from a previous game don't touch the new grid.
         int loadGeneration = 0;
 
+        // Ping column sort: None keeps the config order, otherwise routes are ordered by best ping.
+        SortOrder pingSort = SortOrder.None;
+
         // Reused across requests to avoid socket exhaustion.
         private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+
+        // What a grid row shows: a whole route (collapsed) or one of its relays (extended).
+        class RowRef
+        {
+            public Route route;
+            public Relay relay;
+        }
 
         public Main()
         {
@@ -54,9 +62,7 @@ namespace SteamRouteTool
         {
             loadGeneration++;
             routes = new List<Route>();
-            rowCount = 0;
             columnChecked = false;
-            firstLoad = true;
             routeDataGrid.Rows.Clear();
             cb_Game.Enabled = false;
             btn_PingRoutes.Enabled = false;
@@ -84,19 +90,14 @@ namespace SteamRouteTool
         // Loads routes asynchronously so the UI stays responsive.
         private async Task PopulateRoutesAsync(int[] appIds)
         {
+            List<Route> loaded = new List<Route>();
             try
             {
                 string[] raws = await Task.WhenAll(appIds.Select(id => _httpClient.GetStringAsync(networkconfigURL + id)));
 
                 // Parse JSON on a background thread to avoid blocking the UI.
                 // Configs are merged by POP name, relays deduplicated by IP.
-                await Task.Run(() => { foreach (string raw in raws.Distinct()) { ParseRoutes(raw); } });
-
-                // Rows are assigned after merging so each route's relays stay adjacent in the grid.
-                foreach (Route route in routes)
-                {
-                    for (int i = 0; i < route.ranges.Count; i++) { route.row_index.Add(rowCount++); }
-                }
+                await Task.Run(() => { foreach (string raw in raws.Distinct()) { ParseRoutes(raw, loaded); } });
             }
             catch (Exception ex)
             {
@@ -105,136 +106,169 @@ namespace SteamRouteTool
             }
 
             // Back on UI thread after await — safe to update controls directly.
+            routes = loaded;
             btn_PingRoutes.Enabled = true;
             lb_GettingRoutes.Visible = false;
             btn_About.Visible = true;
-            PopulateRouteDataGrid();
+            GetCurrentBlocked();
+            RenderGrid();
+            PingRoutes();
         }
 
-        // Parses the SDR JSON and fills the routes list. Runs on a background thread.
-        private void ParseRoutes(string raw)
+        // Parses the SDR JSON into the given list. Runs on a background thread.
+        private static void ParseRoutes(string raw, List<Route> into)
         {
             JObject jObj = JsonConvert.DeserializeObject<JObject>(raw);
             foreach (KeyValuePair<string, JToken> rc in (JObject)jObj["pops"])
             {
-                if (rc.Value.ToString().Contains("relays") && !rc.Value.ToString().Contains("cloud-test"))
+                if (rc.Value["relays"] == null || rc.Value.ToString().Contains("cloud-test")) { continue; }
+
+                Route route = into.FirstOrDefault(x => x.name == rc.Key);
+                if (route == null)
                 {
-                    Route route = routes.FirstOrDefault(x => x.name == rc.Key);
-                    bool isNew = route == null;
-                    if (isNew)
-                    {
-                        route = new Route();
-                        route.name = rc.Key;
-                        if (rc.Value.ToString().Contains("\"desc\"")) { route.desc = rc.Value["desc"].ToString(); }
-                        route.ranges = new Dictionary<string, string>();
-                        route.row_index = new List<int>();
-                        if (rc.Value.ToString().Contains("partners\": 2")) { route.pw = true; }
-                        else { route.pw = false; }
-                        route.extended = false;
-                        route.all_check = false;
-                    }
-                    foreach (JObject range in rc.Value["relays"])
-                    {
-                        string ip = range["ipv4"].ToString();
-                        if (route.ranges.ContainsKey(ip)) { continue; }
-                        route.ranges.Add(ip, range["port_range"][0] + "-" + range["port_range"][1]);
-                    }
-                    if (isNew) { routes.Add(route); }
+                    route = new Route();
+                    route.name = rc.Key;
+                    if (rc.Value["desc"] != null) { route.desc = rc.Value["desc"].ToString(); }
+                    route.pw = rc.Value["partners"] != null && (int)rc.Value["partners"] == 2;
+                    into.Add(route);
+                }
+                foreach (JObject range in rc.Value["relays"])
+                {
+                    string ip = range["ipv4"].ToString();
+                    if (route.relays.Any(r => r.ip == ip)) { continue; }
+                    route.relays.Add(new Relay { ip = ip, ports = range["port_range"][0] + "-" + range["port_range"][1] });
                 }
             }
         }
 
-        private void PopulateRouteDataGrid()
+        // Rebuilds the grid from the route model. Collapsed routes get a single row; extended ones
+        // get one row per relay. No hidden rows are kept, so what is in the model is what is shown.
+        private void RenderGrid()
         {
-            if (routeDataGrid.RowCount == 0)
+            int firstVisible = routeDataGrid.FirstDisplayedScrollingRowIndex;
+
+            IEnumerable<Route> ordered = routes;
+            if (pingSort != SortOrder.None)
             {
-                for (int i = 0; i < rowCount; i++)
-                {
-                    routeDataGrid.Rows.Add();
-                    routeDataGrid.Rows[i].Cells[2].Value = false;
-                }
+                // Routes without a reply go last in both directions.
+                Func<Route, int> key = r => r.BestPing.HasValue && r.BestPing.Value >= 0 ? r.BestPing.Value : int.MaxValue;
+                ordered = pingSort == SortOrder.Ascending
+                    ? routes.OrderBy(key)
+                    : routes.OrderBy(r => key(r) == int.MaxValue).ThenByDescending(key);
             }
 
-            foreach (Route route in routes)
+            routeDataGrid.SuspendLayout();
+            routeDataGrid.Rows.Clear();
+            foreach (Route route in ordered)
             {
-                for (int i = 0; i < route.ranges.Count; i++)
+                if (!route.extended || route.relays.Count == 1)
                 {
-                    if (route.desc != null) { routeDataGrid.Rows[route.row_index[i]].Cells[0].Value = route.desc + " " + (i + 1); }
-                    else { routeDataGrid.Rows[route.row_index[i]].Cells[0].Value = route.name + " " + (i + 1); }
-                    if (route.extended == false)
-                    {
-                        if (route.desc != null) { routeDataGrid.Rows[route.row_index[0]].Cells[0].Value = route.desc; }
-                        else { routeDataGrid.Rows[route.row_index[0]].Cells[0].Value = route.name; }
-                    }
-                    if (i > 0 && route.extended == false) { routeDataGrid.Rows[route.row_index[i]].Visible = false; }
-                    else { routeDataGrid.Rows[route.row_index[i]].Visible = true; }
+                    AddRow(new RowRef { route = route });
+                }
+                else
+                {
+                    foreach (Relay relay in route.relays) { AddRow(new RowRef { route = route, relay = relay }); }
                 }
             }
+            routeDataGrid.ResumeLayout();
 
-            if (firstLoad)
+            if (firstVisible >= 0 && firstVisible < routeDataGrid.Rows.Count)
             {
-                PingRoutes();
-                GetCurrentBlocked();
+                routeDataGrid.FirstDisplayedScrollingRowIndex = firstVisible;
             }
-            firstLoad = false;
+            Ping.HeaderCell.SortGlyphDirection = pingSort;
         }
 
-        // Applies ping result color and value to a single grid cell. Must be called on the UI thread.
-        private void UpdatePingCell(int rowIndex, string responseTime)
+        private void AddRow(RowRef rowRef)
         {
-            DataGridViewCellStyle style = routeDataGrid.Rows[rowIndex].Cells[1].Style;
-            if (responseTime != "-1")
+            int i = routeDataGrid.Rows.Add();
+            DataGridViewRow row = routeDataGrid.Rows[i];
+            row.Tag = rowRef;
+            if (rowRef.relay == null)
             {
-                int ms = Convert.ToInt32(responseTime);
-                if (ms <= 50) { style.ForeColor = Color.Green; }
-                else if (ms <= 100) { style.ForeColor = Color.Orange; }
-                else { style.ForeColor = Color.Red; }
+                row.Cells[0].Value = rowRef.route.DisplayName;
             }
             else
             {
-                style.ForeColor = Color.DarkRed;
+                row.Cells[0].Value = rowRef.route.DisplayName + " " + (rowRef.route.relays.IndexOf(rowRef.relay) + 1);
             }
-            routeDataGrid.Rows[rowIndex].Cells[1].Value = responseTime;
-            style.BackColor = Color.White;
+            UpdateRow(row);
         }
 
-        // Pings each relay of a single route asynchronously. UI updates happen on the UI thread
-        // after each await, so no BeginInvoke is required.
-        private async void PingSingleRoute(Route route)
+        // Refreshes the ping and checkbox cells of a row from the model.
+        private void UpdateRow(DataGridViewRow row)
+        {
+            RowRef rowRef = (RowRef)row.Tag;
+            int? ping = rowRef.relay != null ? rowRef.relay.ping : rowRef.route.BestPing;
+            bool blocked = rowRef.relay != null ? rowRef.relay.blocked : rowRef.route.relays.All(r => r.blocked);
+
+            DataGridViewCellStyle style = row.Cells[1].Style;
+            style.BackColor = Color.White;
+            if (!ping.HasValue) { row.Cells[1].Value = null; }
+            else
+            {
+                if (ping.Value < 0) { style.ForeColor = Color.DarkRed; }
+                else if (ping.Value <= 50) { style.ForeColor = Color.Green; }
+                else if (ping.Value <= 100) { style.ForeColor = Color.Orange; }
+                else { style.ForeColor = Color.Red; }
+                row.Cells[1].Value = ping.Value.ToString();
+            }
+            row.Cells[2].Value = blocked;
+        }
+
+        private void UpdateRowsOf(Route route)
+        {
+            foreach (DataGridViewRow row in routeDataGrid.Rows)
+            {
+                if (((RowRef)row.Tag).route == route) { UpdateRow(row); }
+            }
+        }
+
+        // Pings each relay of a route in turn. UI updates happen on the UI thread after each await,
+        // so no BeginInvoke is required.
+        private async Task PingRouteAsync(Route route, Relay only = null)
         {
             int generation = loadGeneration;
-            string[] keys = route.ranges.Keys.ToArray();
-            for (int i = 0; i < keys.Length; i++)
+            foreach (Relay relay in route.relays)
             {
-                routeDataGrid.Rows[route.row_index[i]].Cells[1].Style.BackColor = Color.Black;
-                string responseTime = await Task.Run(() => PingHost(keys[i]));
+                if (only != null && relay != only) { continue; }
+                string ip = relay.ip;
+                int result = await Task.Run(() => PingHost(ip));
                 if (generation != loadGeneration) { return; }
-                // Continuation runs on the UI thread via the captured SynchronizationContext.
-                UpdatePingCell(route.row_index[i], responseTime);
+                relay.ping = result;
+                UpdateRowsOf(route);
             }
         }
 
         // Starts pinging all routes in parallel (each route is an independent async task).
-        private void PingRoutes()
+        // Sorted order is refreshed once every reply is in, so rows don't jump around meanwhile.
+        private async void PingRoutes()
         {
-            foreach (Route route in routes)
-            {
-                PingSingleRoute(route);
-            }
+            int generation = loadGeneration;
+            btn_PingRoutes.Enabled = false;
+            await Task.WhenAll(routes.Select(r => PingRouteAsync(r)).ToList());
+            if (generation != loadGeneration) { return; }
+            btn_PingRoutes.Enabled = true;
+            if (pingSort != SortOrder.None) { RenderGrid(); }
         }
 
-        public static string PingHost(string host)
+        // Returns the round-trip time in ms, or -1 when the relay did not answer.
+        public static int PingHost(string host)
         {
             try
             {
-                Ping ping = new Ping();
-                PingReply pingreply = ping.Send(host);
-                if (pingreply.RoundtripTime == 0) { return "-1"; }
-                else { return pingreply.RoundtripTime.ToString(); }
+                using (Ping ping = new Ping())
+                {
+                    PingReply pingreply = ping.Send(host, 2000);
+                    if (pingreply.Status != IPStatus.Success) { return -1; }
+                    return (int)pingreply.RoundtripTime;
+                }
             }
-            catch (Exception) { return "-1"; }
+            catch (Exception) { return -1; }
         }
 
+        // Marks relays that already have a SteamRouteTool- firewall rule. A partially blocked
+        // route is shown extended so the individual checkboxes are visible.
         private void GetCurrentBlocked()
         {
             Type tNetFwPolicy2 = Type.GetTypeFromProgID("HNetCfg.FwPolicy2");
@@ -242,41 +276,16 @@ namespace SteamRouteTool
 
             foreach (INetFwRule rule in fwPolicy2.Rules)
             {
-                if (rule.Name.StartsWith("SteamRouteTool-"))
-                {
-                    // Use Substring so route names that contain hyphens are parsed correctly.
-                    string name = rule.Name.Substring("SteamRouteTool-".Length);
+                if (!rule.Name.StartsWith("SteamRouteTool-")) { continue; }
 
-                    List<string> addr = new List<string>();
-                    foreach (string tosplit in rule.RemoteAddresses.Split(',')) { addr.Add(tosplit.Split('/')[0]); }
-                    foreach (Route route in routes)
-                    {
-                        if (route.name == name)
-                        {
-                            bool extended = true;
-                            bool firstBlocked = false;
-                            int blockedCount = 0;
-                            for (int i = 0; i < route.ranges.Count; i++)
-                            {
-                                if (addr.Contains(route.ranges.Keys.ToArray()[i]))
-                                {
-                                    routeDataGrid.Rows[route.row_index[i]].Cells[2].Value = true;
-                                    if (i != 0) { blockedCount++; }
-                                    if (i == 0) { firstBlocked = true; }
-                                }
-                            }
-                            if (blockedCount == route.ranges.Count - 1 && firstBlocked)
-                            {
-                                extended = false;
-                            }
-                            route.extended = extended;
-                            if (extended)
-                            {
-                                foreach (int index in route.row_index) { routeDataGrid.Rows[index].Visible = true; }
-                            }
-                        }
-                    }
-                }
+                // Use Substring so route names that contain hyphens are parsed correctly.
+                string name = rule.Name.Substring("SteamRouteTool-".Length);
+                Route route = routes.FirstOrDefault(r => r.name == name);
+                if (route == null || rule.RemoteAddresses == null) { continue; }
+
+                HashSet<string> addr = new HashSet<string>(rule.RemoteAddresses.Split(',').Select(a => a.Split('/')[0]));
+                foreach (Relay relay in route.relays) { relay.blocked = addr.Contains(relay.ip); }
+                route.extended = route.relays.Any(r => r.blocked) && !route.relays.All(r => r.blocked);
             }
         }
 
@@ -293,9 +302,12 @@ namespace SteamRouteTool
             }
             foreach (string name in toRemove) { fwPolicy2.Rules.Remove(name); }
 
-            // Reset all checkbox cells (use Rows.Count, not routes.Count, because each route
-            // may have multiple relay rows).
-            for (int i = 0; i < routeDataGrid.Rows.Count; i++) { routeDataGrid.Rows[i].Cells[2].Value = false; }
+            foreach (Route route in routes)
+            {
+                foreach (Relay relay in route.relays) { relay.blocked = false; }
+            }
+            columnChecked = false;
+            RenderGrid();
 
             MessageBox.Show("You have cleared all firewall rules created by this tool.", "Steam Route Tool - Rules Clear");
         }
@@ -315,93 +327,57 @@ namespace SteamRouteTool
 
         private void RouteDataGrid_CellContentClick(object sender, DataGridViewCellEventArgs e)
         {
-            if (e.ColumnIndex == 0 && e.RowIndex != -1)
-            {
-                Route currentRoute = routes.Where(x => x.row_index.Contains(e.RowIndex)).First();
-                if (currentRoute.all_check && !currentRoute.extended)
-                {
-                    bool blocked = false;
-                    for (int i = 0; i < currentRoute.row_index.Count; i++)
-                    {
-                        if (i == 0)
-                        {
-                            blocked = Convert.ToBoolean(routeDataGrid.Rows[currentRoute.row_index[i]].Cells[2].Value);
-                        }
-                        else
-                        {
-                            routeDataGrid.Rows[currentRoute.row_index[i]].Cells[2].Value = blocked;
-                        }
-                    }
-                }
+            if (e.RowIndex < 0) { return; }
+            DataGridViewRow row = routeDataGrid.Rows[e.RowIndex];
+            RowRef rowRef = (RowRef)row.Tag;
 
-                currentRoute.extended ^= true;
-                currentRoute.all_check ^= true;
-                PopulateRouteDataGrid();
-                PingSingleRoute(currentRoute);
+            // Route name: expand to individual relays or collapse back.
+            if (e.ColumnIndex == 0 && rowRef.route.relays.Count > 1)
+            {
+                rowRef.route.extended ^= true;
+                // Rebuild after the click finishes; clearing rows inside the grid's own event is unsafe.
+                BeginInvoke(new Action(RenderGrid));
             }
 
-            if (e.ColumnIndex == 1 && e.RowIndex != -1)
+            // Ping value: re-ping that relay, or every relay of a collapsed route.
+            if (e.ColumnIndex == 1)
             {
-                _ = PingSingleCellAsync(e.RowIndex);
+                row.Cells[1].Style.BackColor = Color.Black;
+                _ = PingRouteAsync(rowRef.route, rowRef.relay);
             }
 
-            if (e.ColumnIndex == 2 && e.RowIndex != -1)
+            // Checkbox: a collapsed row blocks/unblocks the whole route, a relay row only that relay.
+            if (e.ColumnIndex == 2)
             {
-                Route currentRoute = routes.Where(x => x.row_index.Contains(e.RowIndex)).First();
-                if (!currentRoute.extended) { currentRoute.all_check = true; }
-                else { currentRoute.all_check = false; }
-                SetRule(currentRoute);
-            }
-
-            if (e.ColumnIndex == 2 && e.RowIndex == -1)
-            {
-                if (!columnChecked)
-                {
-                    for (int i = 0; i < routeDataGrid.Rows.Count; i++)
-                    {
-                        routeDataGrid.Rows[i].Cells[2].Value = true;
-                    }
-                    foreach (Route route in routes)
-                    {
-                        SetRule(route);
-                    }
-                    columnChecked = true;
-                }
-                else
-                {
-                    for (int i = 0; i < routeDataGrid.Rows.Count; i++)
-                    {
-                        routeDataGrid.Rows[i].Cells[2].Value = false;
-                    }
-                    // Remove firewall rules for every route when unchecking all.
-                    foreach (Route route in routes)
-                    {
-                        SetRule(route);
-                    }
-                    columnChecked = false;
-                }
+                bool blocked = Convert.ToBoolean(row.Cells[2].EditedFormattedValue);
+                if (rowRef.relay != null) { rowRef.relay.blocked = blocked; }
+                else { foreach (Relay relay in rowRef.route.relays) { relay.blocked = blocked; } }
+                SetRule(rowRef.route);
+                UpdateRowsOf(rowRef.route);
             }
         }
 
-        // Pings the single cell that was clicked (column 1). Runs asynchronously to keep the UI
-        // responsive; UI updates happen on the UI thread after each await.
-        private async Task PingSingleCellAsync(int rowIndex)
+        private void RouteDataGrid_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
         {
-            try
+            // "Ping" header: sort ascending, then descending, then back to config order.
+            if (e.ColumnIndex == 1)
             {
-                Route currentRoute = routes.Where(x => x.row_index.Contains(rowIndex)).First();
-                int i = currentRoute.row_index.IndexOf(rowIndex);
-                string ip = currentRoute.ranges.Keys.ToArray()[i];
-
-                int generation = loadGeneration;
-                routeDataGrid.Rows[rowIndex].Cells[1].Style.BackColor = Color.Black;
-                string responseTime = await Task.Run(() => PingHost(ip));
-                if (generation != loadGeneration) { return; }
-                UpdatePingCell(rowIndex, responseTime);
+                if (pingSort == SortOrder.None) { pingSort = SortOrder.Ascending; }
+                else if (pingSort == SortOrder.Ascending) { pingSort = SortOrder.Descending; }
+                else { pingSort = SortOrder.None; }
+                RenderGrid();
             }
-            catch (Exception ex)
+
+            // "Blocked" header: toggle every route.
+            if (e.ColumnIndex == 2)
             {
-                MessageBox.Show("Ping failed: " + ex.Message, "Steam Route Tool - Error");
+                columnChecked = !columnChecked;
+                foreach (Route route in routes)
+                {
+                    foreach (Relay relay in route.relays) { relay.blocked = columnChecked; }
+                    SetRule(route);
+                }
+                RenderGrid();
             }
         }
 
@@ -412,48 +388,28 @@ namespace SteamRouteTool
             try { fwPolicy2.Rules.Remove("SteamRouteTool-" + route.name); }
             catch { }
 
+            List<Relay> blockedRelays = route.relays.Where(r => r.blocked).ToList();
+            if (blockedRelays.Count == 0) { return; }
+
             INetFwRule fwRule = (INetFwRule2)Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule"));
 
             fwRule.Enabled = true;
             fwRule.Direction = NET_FW_RULE_DIRECTION_.NET_FW_RULE_DIR_OUT;
             fwRule.Action = NET_FW_ACTION_.NET_FW_ACTION_BLOCK;
-
-            List<string> blockedIps = new List<string>();
-
-            int index = 0;
-            for (int i = 0; i < route.ranges.Count; i++)
+            fwRule.RemoteAddresses = string.Join(",", blockedRelays.Select(r => r.ip));
+            fwRule.Protocol = 17;
+            // Ports come from each relay's port_range in the SDR config (currently up to 27140),
+            // so the rule keeps covering relays when Valve widens the range.
+            fwRule.RemotePorts = string.Join(",", blockedRelays.Select(r => r.ports).Distinct());
+            fwRule.Name = "SteamRouteTool-" + route.name;
+            try
             {
-                if ((bool)routeDataGrid.Rows[route.row_index[i]].Cells[2].Value)
-                {
-                    if (index == 0 && route.all_check)
-                    {
-                        blockedIps = route.ranges.Keys.ToList();
-                        break;
-                    }
-                    else
-                    {
-                        blockedIps.Add(route.ranges.Keys.ToArray()[index]);
-                    }
-                }
-                index++;
+                INetFwPolicy2 firewallPolicy = (INetFwPolicy2)Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
+                firewallPolicy.Rules.Add(fwRule);
             }
-            if (blockedIps.Count > 0)
+            catch (Exception ex)
             {
-                fwRule.RemoteAddresses = string.Join(",", blockedIps);
-                fwRule.Protocol = 17;
-                // Ports come from each relay's port_range in the SDR config (currently up to 27140),
-                // so the rule keeps covering relays when Valve widens the range.
-                fwRule.RemotePorts = string.Join(",", blockedIps.Select(ip => route.ranges[ip]).Distinct());
-                fwRule.Name = "SteamRouteTool-" + route.name;
-                try
-                {
-                    INetFwPolicy2 firewallPolicy = (INetFwPolicy2)Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
-                    firewallPolicy.Rules.Add(fwRule);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show("Failed to add firewall rule for " + route.name + ": " + ex.Message, "Steam Route Tool - Error");
-                }
+                MessageBox.Show("Failed to add firewall rule for " + route.name + ": " + ex.Message, "Steam Route Tool - Error");
             }
         }
 

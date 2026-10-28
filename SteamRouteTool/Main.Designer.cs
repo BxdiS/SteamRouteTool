@@ -59,6 +59,7 @@
             this.routeDataGrid.Size = new System.Drawing.Size(269, 240);
             this.routeDataGrid.TabIndex = 0;
             this.routeDataGrid.CellContentClick += new System.Windows.Forms.DataGridViewCellEventHandler(this.RouteDataGrid_CellContentClick);
+            this.routeDataGrid.ColumnHeaderMouseClick += new System.Windows.Forms.DataGridViewCellMouseEventHandler(this.RouteDataGrid_ColumnHeaderMouseClick);
             this.routeDataGrid.CurrentCellDirtyStateChanged += new System.EventHandler(this.RouteDataGrid_CurrentCellDirtyStateChanged);
             // 
             // Name
@@ -76,7 +77,7 @@
             this.Ping.Name = "Ping";
             this.Ping.ReadOnly = true;
             this.Ping.Resizable = System.Windows.Forms.DataGridViewTriState.False;
-            this.Ping.SortMode = System.Windows.Forms.DataGridViewColumnSortMode.NotSortable;
+            this.Ping.SortMode = System.Windows.Forms.DataGridViewColumnSortMode.Programmatic;
             this.Ping.Width = 40;
             // 
             // Blocked
