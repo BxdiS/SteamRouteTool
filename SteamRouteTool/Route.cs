@@ -20,6 +20,16 @@ namespace SteamRouteTool
         public bool extended;
         public bool pw;
 
+        // Valve's typical_pings: ms from this POP to other POPs, keyed by POP name.
+        public Dictionary<string, int> typicalPings = new Dictionary<string, int>();
+
+        // A data center without relays of its own (e.g. Hetzner Helsinki): it can't be blocked,
+        // players reach it through another POP's relays.
+        public bool IsDataCenter { get { return relays.Count == 0; } }
+        // For data centers: estimated ms via the best entry relay, or null when unknown.
+        public int? estimate;
+        public Route via;
+
         public string DisplayName { get { return desc ?? name; } }
 
         // Best reply among the relays; used for the collapsed row and for sorting.

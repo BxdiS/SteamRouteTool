@@ -97,7 +97,11 @@ namespace SteamRouteTool
 
                 // Parse JSON on a background thread to avoid blocking the UI.
                 // Configs are merged by POP name, relays deduplicated by IP.
-                await Task.Run(() => { foreach (string raw in raws.Distinct()) { ParseRoutes(raw, loaded); } });
+                await Task.Run(() =>
+                {
+                    foreach (string raw in raws.Distinct()) { ParseRoutes(raw, loaded); }
+                    RemoveUnreachableDataCenters(loaded);
+                });
             }
             catch (Exception ex)
             {
@@ -121,9 +125,22 @@ namespace SteamRouteTool
             JObject jObj = JsonConvert.DeserializeObject<JObject>(raw);
             foreach (KeyValuePair<string, JToken> rc in (JObject)jObj["pops"])
             {
-                if (rc.Value["relays"] == null || rc.Value.ToString().Contains("cloud-test")) { continue; }
+                if (rc.Value.ToString().Contains("cloud-test")) { continue; }
 
                 Route route = into.FirstOrDefault(x => x.name == rc.Key);
+                // POPs without relays are kept as data centers; they are shown only if
+                // typical_pings link them to a relay POP (see RemoveUnreachableDataCenters).
+                if (rc.Value["relays"] == null)
+                {
+                    if (route == null)
+                    {
+                        route = new Route();
+                        route.name = rc.Key;
+                        if (rc.Value["desc"] != null) { route.desc = rc.Value["desc"].ToString(); }
+                        into.Add(route);
+                    }
+                    continue;
+                }
                 if (route == null)
                 {
                     route = new Route();
@@ -139,6 +156,56 @@ namespace SteamRouteTool
                     route.relays.Add(new Relay { ip = ip, ports = range["port_range"][0] + "-" + range["port_range"][1] });
                 }
             }
+
+            // typical_pings entries look like ["hel", "sto", 7].
+            if (jObj["typical_pings"] is JArray typical)
+            {
+                foreach (JToken entry in typical)
+                {
+                    Route a = into.FirstOrDefault(x => x.name == entry[0].ToString());
+                    Route b = into.FirstOrDefault(x => x.name == entry[1].ToString());
+                    if (a == null || b == null) { continue; }
+                    int ms = (int)entry[2];
+                    a.typicalPings[b.name] = ms;
+                    b.typicalPings[a.name] = ms;
+                }
+            }
+        }
+
+        // Drops data centers that no relay POP has a typical ping to, so they can't be estimated.
+        private static void RemoveUnreachableDataCenters(List<Route> list)
+        {
+            HashSet<string> relayPops = new HashSet<string>(list.Where(r => !r.IsDataCenter).Select(r => r.name));
+            list.RemoveAll(r => r.IsDataCenter && !r.typicalPings.Keys.Any(relayPops.Contains));
+        }
+
+        // Estimates each data center's ping as (your ping to a relay POP) + (Valve's typical ping
+        // from that POP to the data center), taking the cheapest entry. This mirrors how SDR picks
+        // the route, so it is what you get, not a way to change it.
+        private void UpdateEstimates()
+        {
+            foreach (Route dc in routes.Where(r => r.IsDataCenter))
+            {
+                dc.estimate = null;
+                dc.via = null;
+                foreach (KeyValuePair<string, int> link in dc.typicalPings)
+                {
+                    Route entry = routes.FirstOrDefault(r => r.name == link.Key && !r.IsDataCenter);
+                    if (entry == null || !entry.BestPing.HasValue || entry.BestPing.Value < 0) { continue; }
+                    int total = entry.BestPing.Value + link.Value;
+                    if (!dc.estimate.HasValue || total < dc.estimate.Value)
+                    {
+                        dc.estimate = total;
+                        dc.via = entry;
+                    }
+                }
+            }
+        }
+
+        // Ping shown and sorted on for a route: best relay reply, or the estimate for data centers.
+        private static int? ShownPing(Route route)
+        {
+            return route.IsDataCenter ? route.estimate : route.BestPing;
         }
 
         // Rebuilds the grid from the route model. Collapsed routes get a single row; extended ones
@@ -151,7 +218,7 @@ namespace SteamRouteTool
             if (pingSort != SortOrder.None)
             {
                 // Routes without a reply go last in both directions.
-                Func<Route, int> key = r => r.BestPing.HasValue && r.BestPing.Value >= 0 ? r.BestPing.Value : int.MaxValue;
+                Func<Route, int> key = r => ShownPing(r).HasValue && ShownPing(r).Value >= 0 ? ShownPing(r).Value : int.MaxValue;
                 ordered = pingSort == SortOrder.Ascending
                     ? routes.OrderBy(key)
                     : routes.OrderBy(r => key(r) == int.MaxValue).ThenByDescending(key);
@@ -184,7 +251,14 @@ namespace SteamRouteTool
             int i = routeDataGrid.Rows.Add();
             DataGridViewRow row = routeDataGrid.Rows[i];
             row.Tag = rowRef;
-            if (rowRef.relay == null)
+            if (rowRef.route.IsDataCenter)
+            {
+                // Not blockable: no relay IPs. Greyed out, details in the tooltip.
+                row.Cells[0].Value = "~ " + rowRef.route.DisplayName;
+                row.Cells[0].Style.ForeColor = Color.Gray;
+                row.Cells[2].ReadOnly = true;
+            }
+            else if (rowRef.relay == null)
             {
                 row.Cells[0].Value = rowRef.route.DisplayName;
             }
@@ -199,8 +273,26 @@ namespace SteamRouteTool
         private void UpdateRow(DataGridViewRow row)
         {
             RowRef rowRef = (RowRef)row.Tag;
-            int? ping = rowRef.relay != null ? rowRef.relay.ping : rowRef.route.BestPing;
-            bool blocked = rowRef.relay != null ? rowRef.relay.blocked : rowRef.route.relays.All(r => r.blocked);
+            int? ping = rowRef.relay != null ? rowRef.relay.ping : ShownPing(rowRef.route);
+            bool blocked = rowRef.relay != null ? rowRef.relay.blocked
+                : !rowRef.route.IsDataCenter && rowRef.route.relays.All(r => r.blocked);
+
+            if (rowRef.route.IsDataCenter)
+            {
+                Route dc = rowRef.route;
+                string tip = dc.DisplayName + " has no relays of its own, so it can't be blocked or reached directly.";
+                if (dc.via != null)
+                {
+                    tip += Environment.NewLine + "Estimated route: you → " + dc.via.DisplayName + " (" + dc.via.BestPing + " ms) → "
+                        + dc.DisplayName + " (~" + dc.typicalPings[dc.via.name] + " ms, Valve's typical ping).";
+                }
+                else
+                {
+                    tip += Environment.NewLine + "No estimate yet: none of its entry relays answered a ping.";
+                }
+                row.Cells[0].ToolTipText = tip;
+                row.Cells[1].ToolTipText = tip;
+            }
 
             DataGridViewCellStyle style = row.Cells[1].Style;
             style.BackColor = Color.White;
@@ -211,7 +303,7 @@ namespace SteamRouteTool
                 else if (ping.Value <= 50) { style.ForeColor = Color.Green; }
                 else if (ping.Value <= 100) { style.ForeColor = Color.Orange; }
                 else { style.ForeColor = Color.Red; }
-                row.Cells[1].Value = ping.Value.ToString();
+                row.Cells[1].Value = (rowRef.route.IsDataCenter && ping.Value >= 0 ? "~" : "") + ping.Value;
             }
             row.Cells[2].Value = blocked;
         }
@@ -221,6 +313,16 @@ namespace SteamRouteTool
             foreach (DataGridViewRow row in routeDataGrid.Rows)
             {
                 if (((RowRef)row.Tag).route == route) { UpdateRow(row); }
+            }
+        }
+
+        // Data center estimates depend on every relay POP's ping, so refresh them after each reply.
+        private void UpdateDataCenterRows()
+        {
+            UpdateEstimates();
+            foreach (DataGridViewRow row in routeDataGrid.Rows)
+            {
+                if (((RowRef)row.Tag).route.IsDataCenter) { UpdateRow(row); }
             }
         }
 
@@ -237,6 +339,7 @@ namespace SteamRouteTool
                 if (generation != loadGeneration) { return; }
                 relay.ping = result;
                 UpdateRowsOf(route);
+                UpdateDataCenterRows();
             }
         }
 
@@ -330,6 +433,8 @@ namespace SteamRouteTool
             if (e.RowIndex < 0) { return; }
             DataGridViewRow row = routeDataGrid.Rows[e.RowIndex];
             RowRef rowRef = (RowRef)row.Tag;
+            // Data centers are info-only: nothing to ping or block directly.
+            if (rowRef.route.IsDataCenter) { return; }
 
             // Route name: expand to individual relays or collapse back.
             if (e.ColumnIndex == 0 && rowRef.route.relays.Count > 1)
@@ -372,7 +477,7 @@ namespace SteamRouteTool
             if (e.ColumnIndex == 2)
             {
                 columnChecked = !columnChecked;
-                foreach (Route route in routes)
+                foreach (Route route in routes.Where(r => !r.IsDataCenter))
                 {
                     foreach (Relay relay in route.relays) { relay.blocked = columnChecked; }
                     SetRule(route);
