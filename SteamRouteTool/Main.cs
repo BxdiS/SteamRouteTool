@@ -66,7 +66,8 @@ namespace SteamRouteTool
             cb_Game.Enabled = true;
         }
 
-        // Removes any leftover SteamRouteTool rules from a previous session.
+        // Removes leftover rules of the original CSGORoutingTool. Our own SteamRouteTool- rules are
+        // kept so blocks survive a restart; GetCurrentBlocked() restores their checkboxes.
         // Names are collected first to avoid modifying the collection during iteration.
         private void ClearCSGORoutingToolRules()
         {
@@ -75,7 +76,7 @@ namespace SteamRouteTool
             List<string> toRemove = new List<string>();
             foreach (INetFwRule rule in fwPolicy2.Rules)
             {
-                if (rule.Name.StartsWith("SteamRouteTool-")) { toRemove.Add(rule.Name); }
+                if (rule.Name.StartsWith("CSGORoutingTool-")) { toRemove.Add(rule.Name); }
             }
             foreach (string name in toRemove) { fwPolicy2.Rules.Remove(name); }
         }
@@ -136,7 +137,7 @@ namespace SteamRouteTool
                     {
                         string ip = range["ipv4"].ToString();
                         if (route.ranges.ContainsKey(ip)) { continue; }
-                        route.ranges.Add(ip, range["port_range"].ToString());
+                        route.ranges.Add(ip, range["port_range"][0] + "-" + range["port_range"][1]);
                     }
                     if (isNew) { routes.Add(route); }
                 }
@@ -417,7 +418,7 @@ namespace SteamRouteTool
             fwRule.Direction = NET_FW_RULE_DIRECTION_.NET_FW_RULE_DIR_OUT;
             fwRule.Action = NET_FW_ACTION_.NET_FW_ACTION_BLOCK;
 
-            string remoteAddresses = "";
+            List<string> blockedIps = new List<string>();
 
             int index = 0;
             for (int i = 0; i < route.ranges.Count; i++)
@@ -426,28 +427,33 @@ namespace SteamRouteTool
                 {
                     if (index == 0 && route.all_check)
                     {
-                        foreach (KeyValuePair<string, string> range in route.ranges)
-                        {
-                            remoteAddresses += range.Key + ",";
-                        }
+                        blockedIps = route.ranges.Keys.ToList();
                         break;
                     }
                     else
                     {
-                        remoteAddresses += route.ranges.Keys.ToArray()[index] + ",";
+                        blockedIps.Add(route.ranges.Keys.ToArray()[index]);
                     }
                 }
                 index++;
             }
-            if (remoteAddresses != "")
+            if (blockedIps.Count > 0)
             {
-                remoteAddresses = remoteAddresses.Substring(0, remoteAddresses.Length - 1);
-                fwRule.RemoteAddresses = remoteAddresses;
+                fwRule.RemoteAddresses = string.Join(",", blockedIps);
                 fwRule.Protocol = 17;
-                fwRule.RemotePorts = "27015-27068";
+                // Ports come from each relay's port_range in the SDR config (currently up to 27140),
+                // so the rule keeps covering relays when Valve widens the range.
+                fwRule.RemotePorts = string.Join(",", blockedIps.Select(ip => route.ranges[ip]).Distinct());
                 fwRule.Name = "SteamRouteTool-" + route.name;
-                INetFwPolicy2 firewallPolicy = (INetFwPolicy2)Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
-                firewallPolicy.Rules.Add(fwRule);
+                try
+                {
+                    INetFwPolicy2 firewallPolicy = (INetFwPolicy2)Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2"));
+                    firewallPolicy.Rules.Add(fwRule);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Failed to add firewall rule for " + route.name + ": " + ex.Message, "Steam Route Tool - Error");
+                }
             }
         }
 
