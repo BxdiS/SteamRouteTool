@@ -12,6 +12,7 @@ Blocking specific routes for games that use Valve's network_config.json (e.g. Co
 * Click the route name to reveal additional routes at that location (if available).
 * Click "Blocked" to toggle all checkboxes.
 * Click "Ping" to sort routes by ping (ascending, descending, original order).
+* Grey "~" rows are data centers without relays of their own (e.g. Hetzner Helsinki). They can't be blocked; the ping is an estimate via the best entry relay (hover for details).
 * Click a ping value to re-ping that specific route.
 * Clear Rules will clear all firewall rules.
 * Ping Routes will ping all routes and update their values.
